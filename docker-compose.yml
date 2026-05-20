@@ -1,0 +1,14 @@
+services:
+  tiklinks:
+    image: liberchat/tiklinks:latest
+    ports:
+      - "${TIKLINKS_PORT:-4242}:4242"
+    environment:
+      TIKLINKS_SITE_URL: "${TIKLINKS_SITE_URL:-https://votre-site/index.php}"
+      TIKLINKS_DATA_DIR: "/data"
+    volumes:
+      - tiklinks-data:/data
+    restart: unless-stopped
+
+volumes:
+  tiklinks-data:

@@ -1,0 +1,11 @@
+.git
+.gitignore
+linkdata.sqlite
+linkdata.sqlite-wal
+linkdata.sqlite-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+tiklinks-data/
+/tmp/
