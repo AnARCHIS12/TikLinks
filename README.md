@@ -15,12 +15,7 @@
   <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-f5d90a?style=for-the-badge&labelColor=111111">
 </p>
 
-<p align="center">
-  <a href="https://github.com/LaurentVoanh">
-    <img alt="Projet original" src="https://img.shields.io/badge/projet%20original-LaurentVoanh-00ffff?style=for-the-badge&logo=github&logoColor=111111&labelColor=111111">
-  </a>
-  <img alt="Crédits" src="https://img.shields.io/badge/cr%C3%A9dits-merci%20pour%20ce%20projet%20g%C3%A9nial-ff00ff?style=for-the-badge&labelColor=111111">
-</p>
+
 
 > Projet original de [LaurentVoanh](https://github.com/LaurentVoanh). Merci à toi pour ce projet génial.
 
