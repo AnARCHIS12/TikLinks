@@ -17,7 +17,7 @@
 
 
 
-> Projet original de [LaurentVoanh](https://github.com/LaurentVoanh). Merci à toi pour ce projet génial.
+
 
 ## Aperçu
 
