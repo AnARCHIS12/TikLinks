@@ -9,3 +9,4 @@ linkdata.sqlite-shm
 *.db
 tiklinks-data/
 /tmp/
+tests/

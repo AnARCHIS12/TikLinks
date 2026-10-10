@@ -1,8 +1,35 @@
 <?php
+declare(strict_types=1);
+
 // ============================================================
 // index.php - TikTok Linktree free
 // Stack: PHP 8+, SQLite WAL, file_get_contents (no cURL)
 // ============================================================
+
+// Static file router for PHP built-in server (php -S)
+if (php_sapi_name() === 'cli-server') {
+    $uriPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '';
+    if ($uriPath !== '' && $uriPath !== '/') {
+        $file = __DIR__ . $uriPath;
+        $real = realpath($file);
+        if ($real && str_starts_with($real, __DIR__) && is_file($real)) {
+            $ext = strtolower(pathinfo($real, PATHINFO_EXTENSION));
+            if (in_array($ext, ['sqlite', 'db', 'htaccess', 'env', 'git', 'md', 'yml', 'yaml', 'dockerfile'], true)
+                || str_contains($uriPath, '/.')
+                || basename($real) === 'index.php') {
+                http_response_code(403);
+                exit('Accès refusé');
+            }
+            return false;
+        }
+    }
+}
+
+// HTTP Security Headers
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: SAMEORIGIN');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+header("Permissions-Policy: geolocation=(), camera=(), microphone=()");
 
 define('DATA_DIR', getenv('TIKLINKS_DATA_DIR') ?: dirname(__DIR__) . '/tiklinks-data');
 define('DB_PATH', getenv('TIKLINKS_DB_PATH') ?: DATA_DIR . '/linkdata.sqlite');
@@ -14,6 +41,11 @@ function normalizeSiteUrl(?string $url): string {
 }
 
 define('SITE_URL', normalizeSiteUrl(getenv('TIKLINKS_SITE_URL') ?: 'http://localhost:4242/index.php'));
+
+function assetUrl(string $path): string {
+    $base = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? ''), '/');
+    return ($base === '' ? '' : $base . '/') . 'assets/' . ltrim($path, '/');
+}
 
 function e(?string $value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -58,8 +90,20 @@ function validColor(?string $color, string $fallback): string {
     return preg_match('/^#[0-9a-fA-F]{6}$/', $color) ? strtolower($color) : $fallback;
 }
 
-function cssUrl(?string $url): string {
-    return str_replace(["\\", "\"", "\n", "\r"], ["\\\\", "\\\"", "", ""], (string)$url);
+function safeCssUrl(?string $url): string {
+    $url = trim((string)$url);
+    if ($url === '' || !filter_var($url, FILTER_VALIDATE_URL)) {
+        return '';
+    }
+    $parts = parse_url($url);
+    if (!$parts || empty($parts['scheme']) || !in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+        return '';
+    }
+    // Interdire les caractères susceptibles de casser la syntaxe CSS ou de fermer une balise HTML
+    if (preg_match('/[<>"\'\\\\();\s]/', $url) || stripos($url, '</') !== false) {
+        return '';
+    }
+    return $url;
 }
 
 function validTab(string $tab): string {
@@ -68,6 +112,9 @@ function validTab(string $tab): string {
 
 function normalizeIcon(?string $icon): string {
     $icon = trim((string)$icon);
+    if ($icon === 'assets/icons/militant.svg' || $icon === 'https://militant.revlibertaire.com/assets/favicon.svg') {
+        return 'assets/icons/militant.svg';
+    }
     if (isValidPublicUrl($icon)) {
         return $icon;
     }
@@ -79,6 +126,9 @@ function normalizeIcon(?string $icon): string {
 
 function renderIcon(?string $icon): string {
     $icon = normalizeIcon($icon);
+    if ($icon === 'assets/icons/militant.svg') {
+        return '<img src="' . e(assetUrl('icons/militant.svg')) . '" alt="" loading="lazy">';
+    }
     if (isValidPublicUrl($icon)) {
         return '<img src="' . e($icon) . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
     }
@@ -556,9 +606,17 @@ function getDB(): PDO {
             member_id INTEGER NOT NULL,
             video_url TEXT NOT NULL,
             caption TEXT DEFAULT '',
+            thumbnail_url TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
             FOREIGN KEY(member_id) REFERENCES members(id)
         );
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL,
+            action TEXT NOT NULL,
+            attempted_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_limits_lookup ON rate_limits (key, action, attempted_at);
     ");
     ensureColumn($db, 'members', 'custom_bg_color', "TEXT DEFAULT '#101018'");
     ensureColumn($db, 'members', 'custom_card_color', "TEXT DEFAULT '#ffffff'");
@@ -571,13 +629,52 @@ function getDB(): PDO {
     ensureColumn($db, 'members', 'totp_secret', "TEXT DEFAULT ''");
     ensureColumn($db, 'members', 'totp_enabled', "INTEGER DEFAULT 0");
     ensureColumn($db, 'members', 'admin_avatar_url', "TEXT DEFAULT ''");
+    ensureColumn($db, 'tiktok_videos', 'thumbnail_url', "TEXT DEFAULT ''");
     return $db;
 }
 
+// ─── RATE LIMITING HELPERS ──────────────────────────────────
+function getClientIp(): string {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $parts = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+        $candidate = trim($parts[0]);
+        if (filter_var($candidate, FILTER_VALIDATE_IP)) {
+            $ip = $candidate;
+        }
+    }
+    return $ip;
+}
+
+function checkRateLimit(PDO $db, string $key, string $action, int $maxAttempts = 5, int $windowSeconds = 900): bool {
+    $now = time();
+    $cutoff = $now - $windowSeconds;
+    if (random_int(1, 100) <= 5) {
+        $clean = $db->prepare("DELETE FROM rate_limits WHERE attempted_at < ?");
+        $clean->execute([$now - 86400]);
+    }
+    $stmt = $db->prepare("SELECT COUNT(*) FROM rate_limits WHERE key = ? AND action = ? AND attempted_at >= ?");
+    $stmt->execute([$key, $action, $cutoff]);
+    return ((int)$stmt->fetchColumn()) < $maxAttempts;
+}
+
+function recordRateLimitAttempt(PDO $db, string $key, string $action): void {
+    $stmt = $db->prepare("INSERT INTO rate_limits (key, action, attempted_at) VALUES (?, ?, ?)");
+    $stmt->execute([$key, $action, time()]);
+}
+
+function clearRateLimit(PDO $db, string $key, string $action): void {
+    $stmt = $db->prepare("DELETE FROM rate_limits WHERE key = ? AND action = ?");
+    $stmt->execute([$key, $action]);
+}
+
 // ─── SESSION + AUTH ─────────────────────────────────────────
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+
 session_set_cookie_params([
     'httponly' => true,
-    'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),
+    'secure' => $isHttps,
     'samesite' => 'Lax',
 ]);
 session_start();
@@ -605,57 +702,86 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         http_response_code(400);
         $error = "Session expirée, réessaie.";
     } elseif ($post_action === 'register') {
-        $username = trim($_POST['username'] ?? '');
-        $password = $_POST['password'] ?? '';
-        $display  = trim($_POST['display_name'] ?? $username);
-        if (preg_match('/^[a-zA-Z0-9_.-]{3,32}$/', $username) && strlen($password) >= 8) {
-            try {
-                $db->prepare("INSERT INTO members (username,password,display_name) VALUES (?,?,?)")
-                   ->execute([$username, password_hash($password, PASSWORD_DEFAULT), $display]);
-                session_regenerate_id(true);
-                $_SESSION['member_id'] = $db->lastInsertId();
-                safeRedirect('?action=admin');
-            } catch (Exception $e) {
-                $error = "Nom d'utilisateur déjà pris.";
-            }
+        $ipKey = 'register_ip_' . getClientIp();
+        if (!checkRateLimit($db, $ipKey, 'register', 5, 3600)) {
+            $error = "Trop d'inscriptions récentes. Réessaie plus tard.";
         } else {
-            $error = "Pseudo 3-32 caractères (lettres, chiffres, . _ -), mot de passe 8+ caractères.";
+            $username = trim($_POST['username'] ?? '');
+            $password = $_POST['password'] ?? '';
+            $display  = trim($_POST['display_name'] ?? $username);
+            if (preg_match('/^[a-zA-Z0-9_.-]{3,32}$/', $username) && strlen($password) >= 8) {
+                try {
+                    $db->prepare("INSERT INTO members (username,password,display_name) VALUES (?,?,?)")
+                       ->execute([$username, password_hash($password, PASSWORD_DEFAULT), $display]);
+                    session_regenerate_id(true);
+                    $_SESSION['member_id'] = $db->lastInsertId();
+                    safeRedirect('?action=admin');
+                } catch (Exception $e) {
+                    $error = "Nom d'utilisateur déjà pris.";
+                }
+            } else {
+                $error = "Pseudo 3-32 caractères (lettres, chiffres, . _ -), mot de passe 8+ caractères.";
+            }
         }
     } elseif ($post_action === 'login') {
-        $username = trim($_POST['username'] ?? '');
-        $password = $_POST['password'] ?? '';
-        $s = $db->prepare("SELECT * FROM members WHERE username=?");
-        $s->execute([$username]);
-        $m = $s->fetch(PDO::FETCH_ASSOC);
-        if ($m && password_verify($password, $m['password'])) {
-            session_regenerate_id(true);
-            if (!empty($m['totp_enabled'])) {
-                $_SESSION['pending_totp_member_id'] = $m['id'];
-                safeRedirect('?action=totp');
-            }
-            $_SESSION['member_id'] = $m['id'];
-            safeRedirect('?action=admin');
+        $ipKey = 'login_ip_' . getClientIp();
+        if (!checkRateLimit($db, $ipKey, 'login', 5, 900)) {
+            $error = "Trop de tentatives de connexion infructueuses. Réessaie dans 15 minutes.";
         } else {
-            $error = "Identifiants incorrects.";
+            $username = trim($_POST['username'] ?? '');
+            $password = $_POST['password'] ?? '';
+            $s = $db->prepare("SELECT * FROM members WHERE username=?");
+            $s->execute([$username]);
+            $m = $s->fetch(PDO::FETCH_ASSOC);
+            if ($m && password_verify($password, $m['password'])) {
+                clearRateLimit($db, $ipKey, 'login');
+                session_regenerate_id(true);
+                if (!empty($m['totp_enabled'])) {
+                    $_SESSION['pending_totp_member_id'] = $m['id'];
+                    safeRedirect('?action=totp');
+                }
+                $_SESSION['member_id'] = $m['id'];
+                safeRedirect('?action=admin');
+            } else {
+                recordRateLimitAttempt($db, $ipKey, 'login');
+                $error = "Identifiants incorrects.";
+            }
         }
     } elseif ($post_action === 'verify_totp') {
         $pendingId = $_SESSION['pending_totp_member_id'] ?? null;
         if (!$pendingId) {
             $error = "Session 2FA expirée.";
         } else {
-            $s = $db->prepare("SELECT * FROM members WHERE id=?");
-            $s->execute([$pendingId]);
-            $m = $s->fetch(PDO::FETCH_ASSOC);
-            if ($m && !empty($m['totp_enabled']) && verifyTotp((string)$m['totp_secret'], $_POST['totp_code'] ?? '')) {
-                unset($_SESSION['pending_totp_member_id']);
-                session_regenerate_id(true);
-                $_SESSION['member_id'] = $m['id'];
-                safeRedirect('?action=admin');
+            $totpKey = 'totp_member_' . (string)$pendingId;
+            if (!checkRateLimit($db, $totpKey, 'totp', 5, 900)) {
+                $error = "Trop de tentatives 2FA infructueuses. Réessaie dans 15 minutes.";
             } else {
-                $error = "Code 2FA invalide.";
+                $s = $db->prepare("SELECT * FROM members WHERE id=?");
+                $s->execute([$pendingId]);
+                $m = $s->fetch(PDO::FETCH_ASSOC);
+                if ($m && !empty($m['totp_enabled']) && verifyTotp((string)$m['totp_secret'], $_POST['totp_code'] ?? '')) {
+                    clearRateLimit($db, $totpKey, 'totp');
+                    unset($_SESSION['pending_totp_member_id']);
+                    session_regenerate_id(true);
+                    $_SESSION['member_id'] = $m['id'];
+                    safeRedirect('?action=admin');
+                } else {
+                    recordRateLimitAttempt($db, $totpKey, 'totp');
+                    $error = "Code 2FA invalide.";
+                }
             }
         }
     } elseif ($post_action === 'logout') {
+        $_SESSION = [];
+        if (ini_get("session.use_cookies")) {
+            $params = session_get_cookie_params();
+            setcookie(session_name(), '', time() - 42000,
+                $params["path"] ?? '/',
+                $params["domain"] ?? '',
+                $params["secure"] ?? false,
+                $params["httponly"] ?? true
+            );
+        }
         session_destroy();
         safeRedirect();
     } elseif ($post_action === 'change_password' && isLoggedIn()) {
@@ -677,10 +803,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
     } elseif ($post_action === 'generate_totp' && isLoggedIn()) {
         $m = currentMember();
         if ($m) {
-            $db->prepare("UPDATE members SET totp_secret=?, totp_enabled=0 WHERE id=?")
-               ->execute([generateTotpSecret(), $m['id']]);
+            if (!empty($m['totp_enabled'])) {
+                $password = $_POST['password'] ?? '';
+                if (!password_verify($password, $m['password'])) {
+                    $error = "Mot de passe incorrect pour réinitialiser la 2FA.";
+                } else {
+                    $db->prepare("UPDATE members SET totp_secret=?, totp_enabled=0 WHERE id=?")
+                       ->execute([generateTotpSecret(), $m['id']]);
+                    safeRedirect('?action=admin&tab=account&saved=1');
+                }
+            } else {
+                $db->prepare("UPDATE members SET totp_secret=?, totp_enabled=0 WHERE id=?")
+                   ->execute([generateTotpSecret(), $m['id']]);
+                safeRedirect('?action=admin&tab=account&saved=1');
+            }
         }
-        safeRedirect('?action=admin&tab=account&saved=1');
     } elseif ($post_action === 'enable_totp' && isLoggedIn()) {
         $m = currentMember();
         if (!$m || empty($m['totp_secret'])) {
@@ -716,8 +853,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         $customBgImage = trim($_POST['custom_bg_image'] ?? ($m['custom_bg_image'] ?? ''));
         if ($avatarUrl !== '' && !isValidPublicUrl($avatarUrl)) {
             $error = "L'avatar doit être une URL http(s).";
-        } elseif ($customBgImage !== '' && !isValidPublicUrl($customBgImage)) {
-            $error = "L'image de fond doit être une URL http(s).";
+        } elseif ($customBgImage !== '' && safeCssUrl($customBgImage) === '') {
+            $error = "L'image de fond doit être une URL http(s) valide et sécurisée.";
         } else {
         $db->prepare("UPDATE members SET display_name=?, bio=?, tiktok_handle=?, avatar_url=?, template=?, custom_bg_color=?, custom_card_color=?, custom_border_color=?, custom_text_color=?, custom_sub_color=?, custom_button_color=?, custom_button_text_color=?, custom_bg_image=? WHERE id=?")
            ->execute([
@@ -733,7 +870,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
                validColor($_POST['custom_sub_color'] ?? ($m['custom_sub_color'] ?? ''), '#d0d0d0'),
                validColor($_POST['custom_button_color'] ?? ($m['custom_button_color'] ?? ''), '#ffffff'),
                validColor($_POST['custom_button_text_color'] ?? ($m['custom_button_text_color'] ?? ''), '#111111'),
-               $customBgImage,
+               safeCssUrl($customBgImage),
                $m['id']
            ]);
         safeRedirect('?action=admin&tab=' . validTab($_POST['redirect_tab'] ?? 'profile') . '&saved=1');
@@ -763,9 +900,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         if (!isTikTokVideoUrl($videoUrl)) {
             $error = "URL TikTok invalide.";
         } else {
-        $db->prepare("INSERT INTO tiktok_videos (member_id,video_url,caption,sort_order) VALUES (?,?,?,?)")
-           ->execute([$m['id'], $videoUrl, trim($_POST['caption'] ?? ''), (int)$_POST['sort_order']]);
-        safeRedirect('?action=admin&tab=videos&saved=1');
+            $thumbUrl = tiktokThumbnailUrl($videoUrl);
+            $db->prepare("INSERT INTO tiktok_videos (member_id,video_url,caption,thumbnail_url,sort_order) VALUES (?,?,?,?,?)")
+               ->execute([$m['id'], $videoUrl, trim($_POST['caption'] ?? ''), $thumbUrl, (int)$_POST['sort_order']]);
+            safeRedirect('?action=admin&tab=videos&saved=1');
         }
     } elseif ($post_action === 'delete_video' && isLoggedIn()) {
         $m = currentMember();
@@ -901,7 +1039,7 @@ function resolveTemplate(array $member, array $tpls): array {
         'font' => "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         'bodyFont' => "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         'extra' => 'custom',
-        'bgImage' => isValidPublicUrl($bgImage) ? $bgImage : '',
+        'bgImage' => safeCssUrl($bgImage),
     ];
 }
 
@@ -917,7 +1055,7 @@ function renderPublicPage(array $member, array $links, array $videos, array $tpl
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?= $dn ?> | TikLinks</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<link rel="stylesheet" href="<?= e(assetUrl('fontawesome/css/all.min.css')) ?>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -939,7 +1077,7 @@ body{
   min-height:100vh;
   overflow-x:hidden;
   <?php if(!empty($tpl['bgImage'])): ?>
-  background-image:linear-gradient(rgba(0,0,0,.45),rgba(0,0,0,.45)),url("<?= cssUrl($tpl['bgImage']) ?>");
+  background-image:linear-gradient(rgba(0,0,0,.45),rgba(0,0,0,.45)),url("<?= safeCssUrl($tpl['bgImage']) ?>");
   background-size:cover;
   background-position:center;
   background-attachment:fixed;
@@ -1084,7 +1222,7 @@ body::after{content:'';position:fixed;inset:0;background-image:url("data:image/s
   <div class="fade-in" style="animation-delay:.5s;margin-top:30px">
     <div class="section-title">Mes meilleures vidéos</div>
     <div class="videos-grid">
-      <?php foreach($videos as $v): $thumb = tiktokThumbnailUrl($v['video_url']); ?>
+      <?php foreach($videos as $v): $thumb = !empty($v['thumbnail_url']) ? $v['thumbnail_url'] : tiktokThumbnailUrl($v['video_url']); ?>
       <div class="video-card">
         <a href="<?= e($v['video_url']) ?>" target="_blank" rel="noopener noreferrer" class="video-link">
           <div class="video-cover <?= $thumb ? 'has-thumb' : '' ?>">
@@ -1133,7 +1271,7 @@ function renderAdmin(array $member, PDO $db, array $tpls): void {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin — TikLinks</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<link rel="stylesheet" href="<?= e(assetUrl('fontawesome/css/all.min.css')) ?>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -1152,7 +1290,7 @@ function renderAdmin(array $member, PDO $db, array $tpls): void {
   --font:<?= $currentTpl['font'] ?>;
   --body:<?= $currentTpl['bodyFont'] ?>;
 }
-body{background:var(--bg);color:var(--text);font-family:var(--body);min-height:100vh;display:flex;flex-direction:column<?php if(!empty($currentTpl['bgImage'])): ?>;background-image:linear-gradient(rgba(0,0,0,.45),rgba(0,0,0,.45)),url("<?= cssUrl($currentTpl['bgImage']) ?>");background-size:cover;background-position:center;background-attachment:fixed<?php endif; ?>}
+body{background:var(--bg);color:var(--text);font-family:var(--body);min-height:100vh;display:flex;flex-direction:column<?php if(!empty($currentTpl['bgImage'])): ?>;background-image:linear-gradient(rgba(0,0,0,.45),rgba(0,0,0,.45)),url("<?= safeCssUrl($currentTpl['bgImage']) ?>");background-size:cover;background-position:center;background-attachment:fixed<?php endif; ?>}
 <?php if($currentTpl['extra']==='scanlines'): ?>
 body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,255,0.015) 2px,rgba(0,255,255,0.015) 4px);pointer-events:none;z-index:0}
 <?php elseif($currentTpl['extra']==='noise'): ?>
@@ -1396,8 +1534,8 @@ select option{background:#1a1a2e;color:var(--text)}
           <label>Icône</label>
           <input type="hidden" name="icon" id="icon-input" value="fa-solid fa-link">
           <div class="icon-picker">
-            <?php foreach(['fa-solid fa-link','https://militant.revlibertaire.com/assets/favicon.svg','fa-solid fa-mobile-screen','fa-solid fa-music','fa-solid fa-camera','fa-solid fa-film','fa-solid fa-comment','fa-solid fa-globe','fa-solid fa-bag-shopping','fa-solid fa-gamepad','fa-solid fa-envelope','fa-solid fa-microphone','fa-solid fa-tv','fa-solid fa-star','fa-solid fa-lightbulb','fa-solid fa-headphones','fa-solid fa-palette','fa-solid fa-dollar-sign','fa-brands fa-tiktok','fa-brands fa-instagram','fa-brands fa-youtube'] as $ic): ?>
-            <button type="button" class="icon-btn <?= $ic === 'fa-solid fa-link' ? 'active' : '' ?>" title="<?= isValidPublicUrl($ic) ? 'Militant' : e($ic) ?>" onclick="document.getElementById('icon-input').value=<?= e(json_encode($ic)) ?>;document.querySelectorAll('.icon-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active')"><?= renderIcon($ic) ?></button>
+            <?php foreach(['fa-solid fa-link','assets/icons/militant.svg','fa-solid fa-mobile-screen','fa-solid fa-music','fa-solid fa-camera','fa-solid fa-film','fa-solid fa-comment','fa-solid fa-globe','fa-solid fa-bag-shopping','fa-solid fa-gamepad','fa-solid fa-envelope','fa-solid fa-microphone','fa-solid fa-tv','fa-solid fa-star','fa-solid fa-lightbulb','fa-solid fa-headphones','fa-solid fa-palette','fa-solid fa-dollar-sign','fa-brands fa-tiktok','fa-brands fa-instagram','fa-brands fa-youtube'] as $ic): ?>
+            <button type="button" class="icon-btn <?= $ic === 'fa-solid fa-link' ? 'active' : '' ?>" title="<?= $ic === 'assets/icons/militant.svg' ? 'Militant' : e($ic) ?>" onclick="document.getElementById('icon-input').value=<?= e(json_encode($ic)) ?>;document.querySelectorAll('.icon-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active')"><?= renderIcon($ic) ?></button>
             <?php endforeach; ?>
           </div>
         </div>
@@ -1701,7 +1839,7 @@ function renderAuthPage(string $mode, ?string $error = null): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TikLinks — <?= $mode==='register'?'Créer un compte':'Connexion' ?></title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<link rel="stylesheet" href="<?= e(assetUrl('fontawesome/css/all.min.css')) ?>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{
@@ -1774,7 +1912,7 @@ function renderTotpPage(?string $error = null): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TikLinks — Vérification 2FA</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<link rel="stylesheet" href="<?= e(assetUrl('fontawesome/css/all.min.css')) ?>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0a0f;color:#e0e8ff;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -1821,7 +1959,7 @@ function renderHome(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TikLinks — Crée ta page de liens TikTok</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<link rel="stylesheet" href="<?= e(assetUrl('fontawesome/css/all.min.css')) ?>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0a0f;color:#e0e8ff;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;background-image:radial-gradient(ellipse at 20% 20%,rgba(0,255,255,.08),transparent 60%),radial-gradient(ellipse at 80% 80%,rgba(255,0,255,.08),transparent 60%)}
@@ -1868,44 +2006,45 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 </html><?php
 }
 
-// ─── MAIN DISPATCH ───────────────────────────────────────────
-if (!empty($slug)) {
-    // Public profile page
-    $s = $db->prepare("SELECT * FROM members WHERE username=?");
-    $s->execute([$slug]);
-    $member = $s->fetch(PDO::FETCH_ASSOC);
-    if (!$member) { http_response_code(404); die('<h1>Page introuvable</h1>'); }
+if (php_sapi_name() !== 'cli' || realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === realpath(__FILE__)) {
+    if (!empty($slug)) {
+        // Public profile page
+        $s = $db->prepare("SELECT * FROM members WHERE username=?");
+        $s->execute([$slug]);
+        $member = $s->fetch(PDO::FETCH_ASSOC);
+        if (!$member) { http_response_code(404); die('<h1>Page introuvable</h1>'); }
 
-    $ls = $db->prepare("SELECT * FROM links WHERE member_id=? AND active=1 ORDER BY sort_order,id");
-    $ls->execute([$member['id']]);
-    $links = $ls->fetchAll(PDO::FETCH_ASSOC);
+        $ls = $db->prepare("SELECT * FROM links WHERE member_id=? AND active=1 ORDER BY sort_order,id");
+        $ls->execute([$member['id']]);
+        $links = $ls->fetchAll(PDO::FETCH_ASSOC);
 
-    $vs = $db->prepare("SELECT * FROM tiktok_videos WHERE member_id=? ORDER BY sort_order,id");
-    $vs->execute([$member['id']]);
-    $videos = $vs->fetchAll(PDO::FETCH_ASSOC);
+        $vs = $db->prepare("SELECT * FROM tiktok_videos WHERE member_id=? ORDER BY sort_order,id");
+        $vs->execute([$member['id']]);
+        $videos = $vs->fetchAll(PDO::FETCH_ASSOC);
 
-    $tpl = resolveTemplate($member, $templates);
-    renderPublicPage($member, $links, $videos, $tpl);
+        $tpl = resolveTemplate($member, $templates);
+        renderPublicPage($member, $links, $videos, $tpl);
 
-} elseif ($action === 'admin') {
-    if (!isLoggedIn()) { header('Location: ' . SITE_URL . '?action=login'); exit; }
-    $member = currentMember();
-    if (!$member) { session_destroy(); header('Location: ' . SITE_URL . '?action=login'); exit; }
-    renderAdmin($member, $db, $templates);
+    } elseif ($action === 'admin') {
+        if (!isLoggedIn()) { header('Location: ' . SITE_URL . '?action=login'); exit; }
+        $member = currentMember();
+        if (!$member) { session_destroy(); header('Location: ' . SITE_URL . '?action=login'); exit; }
+        renderAdmin($member, $db, $templates);
 
-} elseif ($action === 'register') {
-    if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
-    renderAuthPage('register', $error ?? null);
+    } elseif ($action === 'register') {
+        if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
+        renderAuthPage('register', $error ?? null);
 
-} elseif ($action === 'login') {
-    if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
-    renderAuthPage('login', $error ?? null);
+    } elseif ($action === 'login') {
+        if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
+        renderAuthPage('login', $error ?? null);
 
-} elseif ($action === 'totp') {
-    if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
-    if (empty($_SESSION['pending_totp_member_id'])) { header('Location: ' . SITE_URL . '?action=login'); exit; }
-    renderTotpPage($error ?? null);
+    } elseif ($action === 'totp') {
+        if (isLoggedIn()) { header('Location: ' . SITE_URL . '?action=admin'); exit; }
+        if (empty($_SESSION['pending_totp_member_id'])) { header('Location: ' . SITE_URL . '?action=login'); exit; }
+        renderTotpPage($error ?? null);
 
-} else {
-    renderHome();
+    } else {
+        renderHome();
+    }
 }
