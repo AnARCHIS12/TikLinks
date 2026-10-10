@@ -9,14 +9,13 @@ declare(strict_types=1);
 // Static file router for PHP built-in server (php -S)
 if (php_sapi_name() === 'cli-server') {
     $uriPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '';
-    if ($uriPath !== '' && $uriPath !== '/') {
+    if ($uriPath !== '' && $uriPath !== '/' && $uriPath !== '/index.php') {
         $file = __DIR__ . $uriPath;
         $real = realpath($file);
         if ($real && str_starts_with($real, __DIR__) && is_file($real)) {
             $ext = strtolower(pathinfo($real, PATHINFO_EXTENSION));
-            if (in_array($ext, ['sqlite', 'db', 'htaccess', 'env', 'git', 'md', 'yml', 'yaml', 'dockerfile'], true)
-                || str_contains($uriPath, '/.')
-                || basename($real) === 'index.php') {
+            if (in_array($ext, ['sqlite', 'db', 'htaccess', 'env', 'git', 'md', 'yml', 'yaml', 'dockerfile', 'php'], true)
+                || str_contains($uriPath, '/.')) {
                 http_response_code(403);
                 exit('Accès refusé');
             }
@@ -31,7 +30,7 @@ header('X-Frame-Options: SAMEORIGIN');
 header('Referrer-Policy: strict-origin-when-cross-origin');
 header("Permissions-Policy: geolocation=(), camera=(), microphone=()");
 
-define('DATA_DIR', getenv('TIKLINKS_DATA_DIR') ?: dirname(__DIR__) . '/tiklinks-data');
+define('DATA_DIR', getenv('TIKLINKS_DATA_DIR') ?: (is_dir('/data') ? '/data' : __DIR__ . '/tiklinks-data'));
 define('DB_PATH', getenv('TIKLINKS_DB_PATH') ?: DATA_DIR . '/linkdata.sqlite');
 function normalizeSiteUrl(?string $url): string {
     $url = trim((string)$url);

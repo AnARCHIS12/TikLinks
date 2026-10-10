@@ -7,6 +7,8 @@ COPY . .
 RUN mkdir -p /data \
     && chown -R www-data:www-data /data /var/www/html
 
+ENV TIKLINKS_DATA_DIR=/data
+
 USER www-data
 
 EXPOSE 4242
