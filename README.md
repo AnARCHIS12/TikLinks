@@ -48,7 +48,7 @@
 ## Requirements
 
 ```bash
-PHP >= 8.0
+PHP corrigé : >= 8.2.35 (8.2), >= 8.3.36 (8.3), >= 8.4.27 (8.4) ou >= 8.5.12 (8.5)
 SQLite3 (activé par défaut)
 Serveur web (Apache/Nginx) ou `php -S localhost:4242`
 ```
@@ -119,6 +119,59 @@ Sur un réseau local, garde bien le protocole `http://`. En production derrière
 ```bash
 TIKLINKS_SITE_URL=https://votre-site/index.php docker compose up -d
 ```
+
+## Mise à jour de sécurité PHP — 21 octobre 2026
+
+Les vulnérabilités critiques CVE-2026-109618 et CVE-2026-109619 concernent le moteur PHP.
+Modifier uniquement `index.php` ne les corrige pas. Le Dockerfile utilise
+`php:8.3.36-cli-alpine`, version corrigée de la branche 8.3.
+
+Avis officiel : https://www.php.net/index.php#2026-10-21-5
+
+L'image publique `liberchat/tiklinks:latest` doit être reconstruite et publiée
+depuis ce dépôt après toute modification de la version PHP :
+
+```bash
+docker buildx build --pull --platform linux/amd64,linux/arm64 \
+  -t liberchat/tiklinks:latest --push .
+```
+
+Après publication, les installations Docker Compose existantes peuvent récupérer
+la version corrigée sans reconstruire l'image localement :
+
+```bash
+docker compose pull tiklinks
+docker compose up -d --no-deps --force-recreate tiklinks
+docker compose exec tiklinks php -v
+docker compose logs --tail=50 tiklinks
+```
+
+Pour une installation créée avec la commande `docker run` ci-dessus, recréer le
+conteneur en conservant le même volume :
+
+```bash
+docker pull liberchat/tiklinks:latest
+docker stop tiklinks
+docker rm tiklinks
+docker run -d \
+  --name tiklinks \
+  -p 4242:4242 \
+  -e TIKLINKS_SITE_URL=http://localhost:4242/index.php \
+  -e TIKLINKS_DATA_DIR=/data \
+  -v tiklinks-data:/data \
+  liberchat/tiklinks:latest
+docker exec tiklinks php -v
+```
+
+Vérifier que le conteneur affiche **PHP 8.3.36**, puis tester l'accueil et la
+connexion. Le volume existant `tiklinks-data` est conservé ; ne pas utiliser
+`down -v`.
+
+Pour une installation sans Docker, mettre à jour PHP auprès de l'hébergeur ou du
+fournisseur de paquets, puis redémarrer les processus PHP du serveur web. Vérifier
+la version réellement utilisée par le site : celle de `php -v` en ligne de commande
+peut être différente. Les fournisseurs peuvent aussi rétroporter les correctifs ;
+dans ce cas, vérifier leur avis de sécurité.
 
 ## Image Docker Hub
 
